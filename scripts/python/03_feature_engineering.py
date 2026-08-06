@@ -73,6 +73,29 @@ def lomb_scargle_features(values, times):
         "ls_band_power": band_power,
     }
 
+from scipy.optimize import curve_fit
+
+def sinusoidal_fit_features(values, times):
+    """Genlik, frekans, faz parametrelerini cikarir. Eski calismadaki
+    fikri koruyoruz ama artik missing-value'lari dogru disliyoruz."""
+    v = np.asarray(values, dtype=float)
+    t = np.asarray(times, dtype=float)
+    mask = ~np.isnan(v)
+    v, t = v[mask], t[mask]
+    if len(v) < 5:
+        return {"sin_amplitude": 0.0, "sin_freq": 0.0, "sin_phase": 0.0}
+
+    def sinusoid(t, A, f, phi, offset):
+        return A * np.sin(2 * np.pi * f * t + phi) + offset
+
+    try:
+        guess_freq = 1 / 80.0   # ~80 dk periyot baslangic tahmini
+        popt, _ = curve_fit(sinusoid, t, v,
+                             p0=[np.std(v), guess_freq, 0, np.mean(v)],
+                             maxfev=2000)
+        return {"sin_amplitude": abs(popt[0]), "sin_freq": abs(popt[1]), "sin_phase": popt[2] % (2*np.pi)}
+    except Exception:
+        return {"sin_amplitude": 0.0, "sin_freq": 0.0, "sin_phase": 0.0}
 
 def extract_features_for_experiment(name):
     df = pd.read_csv(PROCESSED / f"{name}_aligned.csv").set_index("ORF")
@@ -92,6 +115,7 @@ def extract_features_for_experiment(name):
         feat["autocorr_lag2"] = safe_autocorr(values, times, 2)
         feat["peak_count"] = count_peaks(values)
         feat.update(lomb_scargle_features(values, times))
+        feat.update(sinusoidal_fit_features(values, times))
 
         rows.append(feat)
 
