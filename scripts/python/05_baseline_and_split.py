@@ -14,53 +14,75 @@ X = df.drop(columns=["ORF", "label"])
 y = df["label"].values
 
 # =========================================================
-# 1) FISHER'S G-TEST BASELINE (klasik istatistiksel yöntem)
-# ML olmadan, sadece cdc15 serisindeki en güçlü periyodogram
-# bileşeninin, beklenen (gürültü altında) dağılımına göre ne
-# kadar aşırı olduğunu test eder. Modelin üstüne inşa ettiği
-# "sıfır noktası" budur.
+# FISHER G-TEST — artık 4 deneyin HER BİRİNDE ayrı hesaplanıyor,
+# sonra Fisher'ın kombine testi (meta-analiz) ile birleştiriliyor.
+# Bu, "ML dört deneyi kullanıyor, klasik test tek deneyi kullanıyor,
+# karşılaştırma adil değil" eleştirisini kapatan, tamamen meşru
+# (hiçbir ML/label bilgisi kullanmayan) bir güçlendirmedir.
 # =========================================================
 
-def fisher_g_test(cdc15_series):
-    """Basitleştirilmiş Fisher G-istatistiği: FFT güç spektrumundaki
-    en büyük bileşenin toplam güce oranı. NaN'lar çıkarılır."""
-    v = cdc15_series[~np.isnan(cdc15_series)]
+def fisher_g_test(series):
+    v = series[~np.isnan(series)]
     n = len(v)
     if n < 4:
         return 0.0, 1.0
     v = v - v.mean()
-    power = np.abs(np.fft.rfft(v))[1:] ** 2   # DC bileşeni haric
+    power = np.abs(np.fft.rfft(v))[1:] ** 2
     if power.sum() == 0:
         return 0.0, 1.0
     g_stat = power.max() / power.sum()
     m = len(power)
-    # Fisher'in asimptotik p-deger yaklaşımı
     p_val = m * (1 - g_stat) ** (m - 1)
-    p_val = min(max(p_val, 0.0), 1.0)
+    p_val = min(max(p_val, 1e-12), 1.0)   # log(0) hatasını önlemek için alt sınır
     return g_stat, p_val
 
-cdc15_raw = pd.read_csv(PROCESSED / "cdc15_aligned.csv").set_index("ORF")
-cdc15_raw = cdc15_raw.loc[df["ORF"]]   # sıralamayı final_dataset ile eşitle
+EXPERIMENTS = ["alpha", "cdc15", "cdc28", "elu"]
+p_values_per_experiment = {}
 
-g_stats, p_vals = [], []
-for _, row in cdc15_raw.iterrows():
-    g, p = fisher_g_test(row.values.astype(float))
-    g_stats.append(g)
-    p_vals.append(p)
+print("=== Fisher G-test — deney bazlı sonuçlar ===")
+for exp in EXPERIMENTS:
+    raw = pd.read_csv(PROCESSED / f"{exp}_aligned.csv").set_index("ORF")
+    raw = raw.loc[df["ORF"]]   # sıralamayı final_dataset ile eşitle
 
-baseline_score = 1 - np.array(p_vals)   # düşük p-değeri = yüksek periyodiklik skoru
-baseline_auc = roc_auc_score(y, baseline_score)
-print(f"Fisher G-test baseline AUC: {baseline_auc:.4f}")
+    p_vals = []
+    for _, row in raw.iterrows():
+        _, p = fisher_g_test(row.values.astype(float))
+        p_vals.append(p)
+    p_vals = np.array(p_vals)
+    p_values_per_experiment[exp] = p_vals
 
-baseline_pred = (np.array(p_vals) < 0.05).astype(int)
-baseline_f1 = f1_score(y, baseline_pred, average="macro")
-baseline_mcc = matthews_corrcoef(y, baseline_pred)
-print(f"Fisher G-test baseline (p<0.05) -> Macro F1: {baseline_f1:.4f}, MCC: {baseline_mcc:.4f}")
+    score = 1 - p_vals
+    auc = roc_auc_score(y, score)
+    pred = (p_vals < 0.05).astype(int)
+    f1 = f1_score(y, pred, average="macro")
+    mcc = matthews_corrcoef(y, pred)
+    print(f"{exp:8s} AUC={auc:.4f}  Macro F1={f1:.4f}  MCC={mcc:.4f}")
 
-pd.DataFrame({
-    "metric": ["AUC", "Macro_F1", "MCC"],
-    "value": [baseline_auc, baseline_f1, baseline_mcc]
-}).to_csv(RESULTS / "baseline_fisher_g_test.csv", index=False)
+# --- Fisher'ın kombine testi: X^2 = -2 * sum(ln(p_i)), df = 2k ---
+p_matrix = np.column_stack([p_values_per_experiment[e] for e in EXPERIMENTS])
+combined_stat = -2 * np.sum(np.log(p_matrix), axis=1)
+combined_p = chi2.sf(combined_stat, df=2 * len(EXPERIMENTS))
+
+combined_score = 1 - combined_p
+combined_auc = roc_auc_score(y, combined_score)
+combined_pred = (combined_p < 0.05).astype(int)
+combined_f1 = f1_score(y, combined_pred, average="macro")
+combined_mcc = matthews_corrcoef(y, combined_pred)
+
+print(f"\n=== Fisher Kombine Testi (4 deney birleşik, X^2 meta-analiz) ===")
+print(f"AUC={combined_auc:.4f}  Macro F1={combined_f1:.4f}  MCC={combined_mcc:.4f}")
+
+baseline_summary = pd.DataFrame([
+    *[{"Yaklaşım": f"Fisher G-test ({e})",
+       "AUC": roc_auc_score(y, 1 - p_values_per_experiment[e]),
+       "Macro_F1": f1_score(y, (p_values_per_experiment[e] < 0.05).astype(int), average="macro"),
+       "MCC": matthews_corrcoef(y, (p_values_per_experiment[e] < 0.05).astype(int))}
+      for e in EXPERIMENTS],
+    {"Yaklaşım": "Fisher Kombine Testi (4 deney, meta-analiz)",
+     "AUC": combined_auc, "Macro_F1": combined_f1, "MCC": combined_mcc},
+])
+baseline_summary.to_csv(RESULTS / "baseline_fisher_g_test.csv", index=False)
+print("\n", baseline_summary.to_string(index=False))
 
 # =========================================================
 # 2) TRAIN / TEST AYRIMI (%80 / %20)
