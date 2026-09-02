@@ -76,8 +76,9 @@ def lomb_scargle_features(values, times):
 from scipy.optimize import curve_fit
 
 def sinusoidal_fit_features(values, times):
-    """Genlik, frekans, faz parametrelerini cikarir. Eski calismadaki
-    fikri koruyoruz ama artik missing-value'lari dogru disliyoruz."""
+    """Genlik, frekans, faz parametrelerini cikarir. Bounds ve makul
+    baslangic tahminleri ile anlamsiz uc degerler (orn. genlik=19288)
+    onlenir, fit kalitesi artirilir."""
     v = np.asarray(values, dtype=float)
     t = np.asarray(times, dtype=float)
     mask = ~np.isnan(v)
@@ -88,15 +89,21 @@ def sinusoidal_fit_features(values, times):
     def sinusoid(t, A, f, phi, offset):
         return A * np.sin(2 * np.pi * f * t + phi) + offset
 
+    amp_guess = max(np.std(v), 1e-3)
+    span = t.max() - t.min()
+    freq_guess = 1 / max(span / 1.5, 10)   # ~1.5 periyot sigacak sekilde kaba tahmin
+    mean_guess = np.mean(v)
+
     try:
-        guess_freq = 1 / 80.0   # ~80 dk periyot baslangic tahmini
-        popt, _ = curve_fit(sinusoid, t, v,
-                             p0=[np.std(v), guess_freq, 0, np.mean(v)],
-                             maxfev=2000)
-        return {"sin_amplitude": abs(popt[0]), "sin_freq": abs(popt[1]), "sin_phase": popt[2] % (2*np.pi)}
+        popt, _ = curve_fit(
+            sinusoid, t, v,
+            p0=[amp_guess, freq_guess, 0.0, mean_guess],
+            bounds=([0, 1 / 600, 0, -np.inf], [10 * amp_guess + 1, 1 / 20, 2 * np.pi, np.inf]),
+            maxfev=5000,
+        )
+        return {"sin_amplitude": abs(popt[0]), "sin_freq": abs(popt[1]), "sin_phase": popt[2] % (2 * np.pi)}
     except Exception:
         return {"sin_amplitude": 0.0, "sin_freq": 0.0, "sin_phase": 0.0}
-
 def extract_features_for_experiment(name):
     df = pd.read_csv(PROCESSED / f"{name}_aligned.csv").set_index("ORF")
     times = np.load(PROCESSED / f"{name}_times.npy")
